@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+from flask_socketio import SocketIO, join_room, leave_room, emit
 from pymongo import MongoClient
 from flask_cors import CORS
 from datetime import datetime, timedelta
@@ -15,6 +16,13 @@ import string
 import logging
 import re
 import pytz
+from io import StringIO
+import csv
+import base64
+import jwt as pyjwt
+from functools import wraps
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from bson import ObjectId
 
 # Configure logging
@@ -24,15 +32,37 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# Load environment variables
 load_dotenv()
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+app.config["JWT_TOKEN_LOCATION"] = ["headers"]
+app.config["JWT_HEADER_NAME"] = "Authorization"
+app.config["JWT_HEADER_TYPE"] = "Bearer"
+
 FARMER_ID_PREFIX = os.getenv('FARMER_ID_PREFIX', 'FARM')
 AGRICULTURALIST_ID_PREFIX = os.getenv('AGRICULTURALIST_ID_PREFIX', 'AGRI')
 SMTP_EMAIL = os.getenv('SMTP_EMAIL')
 SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
+
 jwt = JWTManager(app)
+
+
+@jwt.invalid_token_loader
+def invalid_token_callback(reason):
+    logger.error(f"Invalid JWT: {reason}")
+    return jsonify({"error": reason}), 422
+
+@jwt.unauthorized_loader
+def missing_token_callback(reason):
+    logger.error(f"Missing JWT: {reason}")
+    return jsonify({"error": reason}), 401
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    logger.error("JWT expired")
+    return jsonify({"error": "Token has expired"}), 401
 
 # MongoDB connection
 def connect_database():
@@ -55,6 +85,15 @@ appointments_collection = db['appointments']
 counters_collection = db['counters']
 otps_collection = db['otps']
 pending_updates_collection = db['pending_updates']
+chat_messages_collection = db['chat_messages']
+unread_counts = db.unread_counts
+pending_verifications_collection = db['pending_verifications']
+
+# Create 30-day TTL index for chat messages (auto-deletes messages older than 30 days)
+chat_messages_collection.create_index(
+    "timestamp",
+    expireAfterSeconds=30 * 24 * 60 * 60
+)
 
 # ================= HELPER FUNCTIONS =================
 
@@ -79,13 +118,16 @@ def generate_agriculturalist_id():
     for attempt in range(max_retries):
         random_digits = ''.join(random.choices(string.digits, k=6))
         agriculturalist_id = f"{AGRICULTURALIST_ID_PREFIX}{random_digits}"
-        
-        if not agriculturalists_collection.find_one({"_id": agriculturalist_id}) and \
-           not pending_updates_collection.find_one({"userId": agriculturalist_id}):
+
+        if (
+            not agriculturalists_collection.find_one({"_id": agriculturalist_id})
+            and not pending_updates_collection.find_one({"userId": agriculturalist_id})
+            and not pending_verifications_collection.find_one({"_id": agriculturalist_id})
+        ):
             return agriculturalist_id
-        
+
         logger.warning(f"Collision detected for agriculturalist_id {agriculturalist_id} on attempt {attempt + 1}")
-    
+
     raise Exception("Failed to generate unique agriculturalist_id after maximum retries")
 
 def validate_email_format(email):
@@ -156,37 +198,57 @@ def validate_farmer_registration_data(data):
 
 def validate_agriculturalist_registration_data(data):
     """Validate agriculturalist registration data"""
-    mandatory_fields = ['name', 'email', 'mobileNumber', 'password', 'address', 'cityVillage', 'district', 'state', 'pincode', 'upiId']
-    
-    if not all(field in data for field in mandatory_fields):
-        missing = [field for field in mandatory_fields if field not in data]
+    mandatory_fields = [
+        'name', 'email', 'mobileNumber', 'password',
+        'address', 'cityVillage', 'district', 'state',
+        'pincode', 'upiId', 'professionalRole',
+        'licenseNumber', 'documentImage'
+    ]
+
+    if not all(field in data and data[field] for field in mandatory_fields):
+        missing = [field for field in mandatory_fields if field not in data or not data[field]]
         return False, f"Missing mandatory fields: {', '.join(missing)}"
-    
+
     is_valid, error_msg = validate_email_format(data['email'])
     if not is_valid:
         return False, error_msg
-    
+
     is_valid, error_msg = validate_phone_number(data['mobileNumber'])
     if not is_valid:
         return False, error_msg
-    
+
     is_valid, error_msg = validate_password(data['password'])
     if not is_valid:
         return False, error_msg
-    
+
     is_valid, error_msg = validate_pincode(data['pincode'])
     if not is_valid:
         return False, error_msg
-    
+
     is_valid, error_msg = validate_upi_id(data['upiId'])
     if not is_valid:
         return False, error_msg
-    
-    string_fields = ['name', 'address', 'cityVillage', 'district', 'state', 'upiId']
+
+    valid_roles = [
+        "Agronomist",
+        "Soil Scientist",
+        "Horticulturist",
+        "Crop Protection Specialist",
+        "Agricultural Engineer",
+        "Plant Pathologist",
+        "Farm Management Consultant"
+    ]
+    if data["professionalRole"] not in valid_roles:
+        return False, "Invalid professional role selected"
+
+    string_fields = [
+        'name', 'address', 'cityVillage', 'district', 'state',
+        'upiId', 'professionalRole', 'licenseNumber'
+    ]
     for field in string_fields:
         if not isinstance(data[field], str) or len(data[field].strip()) == 0:
             return False, f"{field} must be a non-empty string"
-    
+
     return True, None
 
 def generate_otp():
@@ -255,6 +317,172 @@ def send_welcome_email_agriculturalist(email, agriculturalist_name, agricultural
     except Exception as e:
         logger.error(f"Failed to send welcome email to {email}: {str(e)}")
         return False
+    
+def admin_jwt_required():
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return jsonify({"error": "Admin token missing"}), 401
+
+            token = auth_header.split(" ")[1]
+
+            try:
+                decoded = pyjwt.decode(
+                    token,
+                    os.getenv("ADMIN_SECRET_KEY"),
+                    algorithms=["HS256"]
+                )
+                if decoded.get("role") != "admin":
+                    return jsonify({"error": "Forbidden"}), 403
+            except pyjwt.ExpiredSignatureError:
+                return jsonify({"error": "Admin token expired"}), 401
+            except pyjwt.InvalidTokenError:
+                return jsonify({"error": "Invalid admin token"}), 401
+
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator   
+
+def send_verification_request_to_admin(application_id, data, document_base64):
+    try:
+        support_email = os.getenv("SUPPORT_EMAIL")
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+
+        msg = MIMEMultipart()
+        msg["Subject"] = f"New Agriculturalist Registration Request — {application_id}"
+        msg["From"] = smtp_email
+        msg["To"] = support_email
+
+        body = f"""
+New Agriculturalist Registration Request
+
+Application ID   : {application_id}
+Name             : {data.get('name')}
+Email            : {data.get('email')}
+Mobile Number    : {data.get('mobileNumber')}
+Professional Role: {data.get('professionalRole')}
+License Number   : {data.get('licenseNumber')}
+Address          : {data.get('address')}
+City/Village     : {data.get('cityVillage')}
+District         : {data.get('district')}
+State            : {data.get('state')}
+Pincode          : {data.get('pincode')}
+Submitted At     : {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+Please review this application in the Agro-Intel admin panel.
+"""
+        msg.attach(MIMEText(body, "plain"))
+
+        if document_base64:
+            try:
+                raw = document_base64.split(",")[1] if "," in document_base64 else document_base64
+                attachment_bytes = base64.b64decode(raw)
+                attachment = MIMEApplication(attachment_bytes, Name="verification_document")
+                attachment["Content-Disposition"] = 'attachment; filename="verification_document"'
+                msg.attach(attachment)
+            except Exception as e:
+                logger.error(f"Failed to attach verification document: {str(e)}")
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+
+        logger.info(f"Support email sent for agriculturalist application {application_id}")
+
+    except Exception as e:
+        logger.error(f"Failed to send support email: {str(e)}")
+    
+def send_reschedule_email_to_farmer(
+    farmer_email,
+    farmer_name,
+    agriculturalist_name,
+    old_date,
+    old_slot_time,
+    new_date,
+    new_slot_time
+):
+    try:
+        body = f"""
+Hello {farmer_name},
+
+Your appointment with agriculturalist {agriculturalist_name} has been rescheduled.
+
+Previous schedule:
+Date: {old_date}
+Time: {old_slot_time}
+
+New schedule:
+Date: {new_date}
+Time: {new_slot_time}
+
+Please log in to Agro-Intel for more details.
+
+Regards,
+Agro-Intel
+"""
+        msg = MIMEText(body)
+        msg["Subject"] = "Agro-Intel Appointment Rescheduled"
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = farmer_email
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        logger.info(f"Reschedule email sent to farmer {farmer_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send reschedule email to {farmer_email}: {str(e)}")
+        return False
+    
+def auto_complete_past_appointments():
+    """Automatically mark past booked appointments as completed"""
+    try:
+        ist_timezone = pytz.timezone("Asia/Kolkata")
+        now_ist = datetime.now(ist_timezone)
+
+        booked_appointments = appointments_collection.find({"status": "booked"})
+
+        for appointment in booked_appointments:
+            appointment_date = appointment.get("date")
+            slot_end_time = appointment.get("slotEndTime")
+
+            if not appointment_date or not slot_end_time:
+                continue
+
+            try:
+                appointment_end_datetime = datetime.strptime(
+                    f"{appointment_date} {slot_end_time}",
+                    "%Y-%m-%d %H:%M"
+                )
+                appointment_end_datetime = ist_timezone.localize(appointment_end_datetime)
+
+                if now_ist > appointment_end_datetime:
+                    appointments_collection.update_one(
+                        {
+                            "_id": appointment["_id"],
+                            "status": "booked"
+                        },
+                        {
+                            "$set": {
+                                "status": "completed",
+                                "completedAt": datetime.now(pytz.UTC)
+                            }
+                        }
+                    )
+                    logger.info(f"Appointment {appointment['_id']} marked as completed")
+
+            except Exception as inner_error:
+                logger.error(
+                    f"Failed to process appointment {appointment.get('_id')}: {str(inner_error)}"
+                )
+
+    except Exception as e:
+        logger.error(f"Error in auto_complete_past_appointments: {str(e)}")
 
 def generate_time_slots():
     """Generate all 48 time slots for a day (00:00 to 23:30)"""
@@ -567,162 +795,158 @@ def update_profile_farmer():
 
 @app.route('/api/register-agriculturalist', methods=['POST'])
 def register_agriculturalist():
-    """Endpoint: Initiate agriculturalist registration"""
+    """Endpoint: Submit agriculturalist registration for admin review"""
     data = request.get_json()
-    
+
     is_valid, error_message = validate_agriculturalist_registration_data(data)
     if not is_valid:
         return jsonify({"error": error_message}), 400
-    
-    if farmers_collection.find_one({"email": data['email']}) or \
-       agriculturalists_collection.find_one({"email": data['email']}):
-        return jsonify({"error": "Email already exists"}), 409
-    
-    if agriculturalists_collection.find_one({"mobileNumber": data['mobileNumber']}):
-        return jsonify({"error": "Mobile number already exists"}), 409
-    
+
+    if farmers_collection.find_one({"email": data["email"]}) or agriculturalists_collection.find_one({"email": data["email"]}):
+        return jsonify({"error": "Email already registered"}), 409
+
+    if farmers_collection.find_one({"mobileNumber": data["mobileNumber"]}) or agriculturalists_collection.find_one({"mobileNumber": data["mobileNumber"]}):
+        return jsonify({"error": "Mobile number already registered"}), 409
+
+    existing_pending = pending_verifications_collection.find_one({
+        "email": data["email"],
+        "status": "pending_verification"
+    })
+    if existing_pending:
+        return jsonify({"error": "Your application is already under review"}), 409
+
     try:
-        agriculturalist_id = generate_agriculturalist_id()
-    except Exception as e:
-        logger.error(f"Error generating agriculturalist_id: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-    
-    hashed_password = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt())
-    otp = generate_otp()
-    hashed_otp = bcrypt.hashpw(otp.encode('utf-8'), bcrypt.gensalt())
-    
-    pending_registration = {
-        "userId": agriculturalist_id,
-        "type": "register_agriculturalist",
-        "agriculturalistData": {
-            "name": data['name'],
-            "email": data['email'],
-            "mobileNumber": data['mobileNumber'],
+        application_id = generate_agriculturalist_id()
+        hashed_password = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt())
+
+        pending_verifications_collection.insert_one({
+            "_id": application_id,
+            "name": data["name"],
+            "email": data["email"],
+            "mobileNumber": data["mobileNumber"],
             "password": hashed_password,
-            "address": data['address'],
-            "cityVillage": data['cityVillage'],
-            "district": data['district'],
-            "state": data['state'],
-            "pincode": data['pincode'],
-            "upiId": data['upiId']
-        },
-        "email": data['email'],
-        "otp": hashed_otp,
-        "createdAt": datetime.now(pytz.UTC)
-    }
-    
-    try:
-        pending_updates_collection.replace_one(
-            {"userId": agriculturalist_id, "type": "register_agriculturalist"},
-            pending_registration,
-            upsert=True
-        )
-        
-        if send_otp_email(data['email'], otp):
-            return jsonify({
-                "message": "OTP sent to email for registration verification",
-                "agriculturalistId": agriculturalist_id
-            }), 200
-        else:
-            pending_updates_collection.delete_one({"userId": agriculturalist_id, "type": "register_agriculturalist"})
-            logger.error(f"Failed to send OTP email for agriculturalist {agriculturalist_id}")
-            return jsonify({"error": "Failed to send OTP email"}), 500
-    
+            "address": data["address"],
+            "cityVillage": data["cityVillage"],
+            "district": data["district"],
+            "state": data["state"],
+            "pincode": data["pincode"],
+            "upiId": data["upiId"],
+            "professionalRole": data["professionalRole"],
+            "licenseNumber": data["licenseNumber"],
+            "documentImage": data["documentImage"],
+            "status": "pending_verification",
+            "submittedAt": datetime.now(pytz.UTC)
+        })
+
+        send_verification_request_to_admin(application_id, data, data["documentImage"])
+
+        logger.info(f"Agriculturalist application submitted: {application_id}")
+        return jsonify({
+            "message": "Registration submitted. Please check your email within 24–48 hours.",
+            "applicationId": application_id
+        }), 200
+
     except Exception as e:
-        logger.error(f"Error initiating agriculturalist registration for agriculturalist {agriculturalist_id}: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Error registering agriculturalist application: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/confirm-register-agriculturalist', methods=['POST'])
 def confirm_register_agriculturalist():
-    """Endpoint: Confirm agriculturalist registration with OTP"""
+    """Endpoint: Confirm approved agriculturalist email with OTP"""
     data = request.get_json()
-    
+
     required_fields = ['agriculturalistId', 'otp']
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Missing agriculturalistId or otp"}), 400
-    
-    pending_registration = pending_updates_collection.find_one({
-        "userId": data['agriculturalistId'],
-        "type": "register_agriculturalist"
-    })
-    
-    if not pending_registration:
-        return jsonify({"error": "Pending registration not found or expired"}), 404
-    
-    if not bcrypt.checkpw(data['otp'].encode('utf-8'), pending_registration['otp']):
-        logger.warning(f"Invalid OTP for agriculturalist {data['agriculturalistId']}")
-        return jsonify({"error": "Invalid OTP"}), 401
-    
-    agriculturalist_data = pending_registration['agriculturalistData']
-    
-    agriculturalist = {
-        "_id": data['agriculturalistId'],
-        "name": agriculturalist_data['name'],
-        "email": agriculturalist_data['email'],
-        "mobileNumber": agriculturalist_data['mobileNumber'],
-        "password": agriculturalist_data['password'],
-        "address": agriculturalist_data['address'],
-        "cityVillage": agriculturalist_data['cityVillage'],
-        "district": agriculturalist_data['district'],
-        "state": agriculturalist_data['state'],
-        "pincode": agriculturalist_data['pincode'],
-        "upiId": agriculturalist_data['upiId'],
-        "isEmailVerified": True,
-        "isAvailable": True,
-        "createdAt": datetime.now(pytz.UTC),
-        "updatedAt": datetime.now(pytz.UTC)
-    }
-    
+
     try:
-        agriculturalists_collection.insert_one(agriculturalist)
-        pending_updates_collection.delete_one({
-            "userId": data['agriculturalistId'],
-            "type": "register_agriculturalist"
-        })
-        
-        send_welcome_email_agriculturalist(
-            agriculturalist_data['email'], 
-            agriculturalist_data['name'], 
-            data['agriculturalistId']
+        otp_record = otps_collection.find_one({"userId": data["agriculturalistId"]})
+
+        if not otp_record:
+            return jsonify({"error": "OTP not found or expired"}), 404
+
+        created_at = otp_record.get("createdAt")
+        if created_at:
+          if created_at.tzinfo is None:
+            created_at = pytz.UTC.localize(created_at)
+
+          if (datetime.now(pytz.UTC) - created_at).total_seconds() > 600:
+              otps_collection.delete_one({"_id": otp_record["_id"]})
+              return jsonify({"error": "OTP expired"}), 401
+
+        if otp_record["otp"] != data["otp"]:
+            logger.warning(f"Invalid OTP for agriculturalist {data['agriculturalistId']}")
+            return jsonify({"error": "Invalid OTP"}), 401
+
+        agriculturalist = agriculturalists_collection.find_one({"_id": data["agriculturalistId"]})
+        if not agriculturalist:
+            return jsonify({"error": "Agriculturalist account not found"}), 404
+
+        agriculturalists_collection.update_one(
+            {"_id": data["agriculturalistId"]},
+            {
+                "$set": {
+                    "isEmailVerified": True,
+                    "updatedAt": datetime.now(pytz.UTC)
+                }
+            }
         )
-        
-        logger.info(f"Agriculturalist {data['agriculturalistId']} registered successfully")
+
+        otps_collection.delete_one({"_id": otp_record["_id"]})
+
+        send_welcome_email_agriculturalist(
+            agriculturalist["email"],
+            agriculturalist["name"],
+            agriculturalist["_id"]
+        )
+
+        logger.info(f"Agriculturalist {data['agriculturalistId']} email verified successfully")
         return jsonify({
             "message": "Agriculturalist Registration Successful",
-            "agriculturalistId": data['agriculturalistId']
-        }), 201
-    
+            "agriculturalistId": data["agriculturalistId"]
+        }), 200
+
     except Exception as e:
-        logger.error(f"Error registering agriculturalist {data['agriculturalistId']}: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Error confirming agriculturalist OTP verification {data.get('agriculturalistId')}: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/login-agriculturalist', methods=['POST'])
 def login_agriculturalist():
-    """Endpoint: Agriculturalist login with email and password"""
+    """Endpoint: Agriculturalist login with admin-approval-aware flow"""
     data = request.get_json()
-    
+
     required_fields = ['email', 'password']
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Missing email or password"}), 400
-    
+
     is_valid, error_msg = validate_email_format(data['email'])
     if not is_valid:
         return jsonify({"error": error_msg}), 400
-    
+
     try:
-        agriculturalist = agriculturalists_collection.find_one({"email": data['email']})
-        
+        agriculturalist = agriculturalists_collection.find_one({"email": data["email"]})
+
         if not agriculturalist:
-            logger.warning(f"Login attempt with non-existent email: {data['email']}")
+            pending = pending_verifications_collection.find_one({"email": data["email"]})
+            if pending and pending.get("status") == "pending_verification":
+                return jsonify({
+                    "error": "Your registration is under review. Please check your email within 24–48 hours."
+                }), 403
+            if pending and pending.get("status") == "rejected":
+                return jsonify({
+                    "error": "Your registration was not approved. Please contact support@agro-intel.com."
+                }), 403
             return jsonify({"error": "Invalid email or password"}), 401
-        
-        if not bcrypt.checkpw(data['password'].encode('utf-8'), agriculturalist['password']):
+
+        if not agriculturalist.get("isEmailVerified", False):
+            return jsonify({
+                "error": "Please verify your email first. Check your inbox for the OTP sent after approval."
+            }), 403
+
+        if not bcrypt.checkpw(data["password"].encode("utf-8"), agriculturalist["password"]):
             logger.warning(f"Invalid password attempt for agriculturalist: {agriculturalist['_id']}")
             return jsonify({"error": "Invalid email or password"}), 401
-        
-        if not agriculturalist.get('isEmailVerified', False):
-            return jsonify({"error": "Email not verified. Please complete registration."}), 403
-        
+
         access_token = create_access_token(
             identity=agriculturalist['_id'],
             additional_claims={
@@ -731,17 +955,17 @@ def login_agriculturalist():
                 "userType": "agriculturalist"
             }
         )
-        
+
         logger.info(f"Agriculturalist {agriculturalist['_id']} logged in successfully")
-        
+
         return jsonify({
             "message": "Agriculturalist login successful",
-            "agriculturalistId": agriculturalist['_id'],
-            "name": agriculturalist['name'],
-            "email": agriculturalist['email'],
+            "agriculturalistId": agriculturalist["_id"],
+            "name": agriculturalist["name"],
+            "email": agriculturalist["email"],
             "token": access_token
         }), 200
-    
+
     except Exception as e:
         logger.error(f"Error during agriculturalist login: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -1103,6 +1327,240 @@ def get_latest_sensor_data(farmer_id):
         logger.error(f"Error retrieving latest sensor data for farmer {farmer_id}: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/admin/login', methods=['POST'])
+def admin_login():
+    data = request.get_json()
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    if email != os.getenv("ADMIN_EMAIL") or password != os.getenv("ADMIN_PASSWORD"):
+        return jsonify({"error": "Invalid admin credentials"}), 401
+
+    token = pyjwt.encode(
+        {
+            "identity": "admin",
+            "role": "admin",
+            "exp": datetime.utcnow() + timedelta(hours=8)
+        },
+        os.getenv("ADMIN_SECRET_KEY"),
+        algorithm="HS256"
+    )
+
+    return jsonify({
+        "message": "Admin login successful",
+        "token": token
+    }), 200
+
+@app.route('/api/admin/pending-registrations', methods=['GET'])
+@admin_jwt_required()
+def get_pending_registrations():
+    try:
+        applications = list(
+            pending_verifications_collection.find(
+                {"status": "pending_verification"},
+                {"documentImage": 0}
+            ).sort("submittedAt", -1)
+        )
+
+        formatted = []
+        for app_data in applications:
+            formatted.append({
+                "applicationId": app_data["_id"],
+                "name": app_data.get("name", ""),
+                "email": app_data.get("email", ""),
+                "mobileNumber": app_data.get("mobileNumber", ""),
+                "professionalRole": app_data.get("professionalRole", ""),
+                "licenseNumber": app_data.get("licenseNumber", ""),
+                "district": app_data.get("district", ""),
+                "state": app_data.get("state", ""),
+                "submittedAt": app_data["submittedAt"].strftime("%Y-%m-%dT%H:%M:%S.000Z") if app_data.get("submittedAt") else None,
+            })
+
+        return jsonify({"applications": formatted, "total": len(formatted)}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/admin/application/<application_id>', methods=['GET'])
+@admin_jwt_required()
+def get_application_detail(application_id):
+    try:
+        app_data = pending_verifications_collection.find_one({"_id": application_id})
+        if not app_data:
+            return jsonify({"error": "Application not found"}), 404
+
+        application = {
+            "applicationId": app_data["_id"],
+            "name": app_data.get("name", ""),
+            "email": app_data.get("email", ""),
+            "mobileNumber": app_data.get("mobileNumber", ""),
+            "professionalRole": app_data.get("professionalRole", ""),
+            "licenseNumber": app_data.get("licenseNumber", ""),
+            "address": app_data.get("address", ""),
+            "cityVillage": app_data.get("cityVillage", ""),
+            "district": app_data.get("district", ""),
+            "state": app_data.get("state", ""),
+            "pincode": app_data.get("pincode", ""),
+            "documentImage": app_data.get("documentImage", ""),
+            "status": app_data.get("status", ""),
+            "submittedAt": app_data["submittedAt"].strftime("%Y-%m-%dT%H:%M:%S.000Z") if app_data.get("submittedAt") else None,
+
+        }
+
+        return jsonify({"application": application}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/admin/approve/<application_id>', methods=['POST'])
+@admin_jwt_required()
+def approve_registration(application_id):
+    try:
+        application = pending_verifications_collection.find_one({"_id": application_id})
+        if not application:
+            return jsonify({"error": "Application not found"}), 404
+
+        if application.get("status") != "pending_verification":
+            return jsonify({"error": "Application already processed"}), 400
+
+        agriculturalists_collection.insert_one({
+            "_id": application["_id"],
+            "name": application["name"],
+            "email": application["email"],
+            "mobileNumber": application["mobileNumber"],
+            "password": application["password"],
+            "address": application["address"],
+            "cityVillage": application["cityVillage"],
+            "district": application["district"],
+            "state": application["state"],
+            "pincode": application["pincode"],
+            "upiId": application.get("upiId", ""),
+            "professionalRole": application["professionalRole"],
+            "licenseNumber": application["licenseNumber"],
+            "isAvailable": True,
+            "isEmailVerified": False,
+            "status": "approved",
+            "createdAt": datetime.now(pytz.UTC),
+            "updatedAt": datetime.now(pytz.UTC)
+        })
+
+        otp = ''.join(random.choices(string.digits, k=6))
+        otps_collection.replace_one(
+            {"userId": application_id},
+            {
+                "userId": application_id,
+                "otp": otp,
+                "createdAt": datetime.now(pytz.UTC)
+            },
+            upsert=True
+        )
+
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+
+        msg = MIMEMultipart()
+        msg["Subject"] = "Welcome to Agro-Intel — Application Approved"
+        msg["From"] = smtp_email
+        msg["To"] = application["email"]
+
+        body = f"""
+Dear {application['name']},
+
+Congratulations! Your agriculturalist registration has been approved.
+
+Your Agriculturalist ID: {application_id}
+
+Please use the OTP below to verify your email and activate your account:
+
+OTP: {otp}
+
+This OTP expires in 10 minutes.
+
+After verification, you can log in to the Agro-Intel portal.
+
+Regards,
+Agro-Intel Team
+"""
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+
+        pending_verifications_collection.update_one(
+            {"_id": application_id},
+            {"$set": {"status": "approved", "approvedAt": datetime.now(pytz.UTC)}}
+        )
+
+        return jsonify({
+            "message": "Application approved. OTP email sent.",
+            "agriculturalistId": application_id
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/admin/reject/<application_id>', methods=['POST'])
+@admin_jwt_required()
+def reject_registration(application_id):
+    try:
+        data = request.get_json() or {}
+        reason = data.get("reason", "Your application could not be approved at this time.")
+
+        application = pending_verifications_collection.find_one({"_id": application_id})
+        if not application:
+            return jsonify({"error": "Application not found"}), 404
+
+        if application.get("status") != "pending_verification":
+            return jsonify({"error": "Application already processed"}), 400
+
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+
+        msg = MIMEMultipart()
+        msg["Subject"] = "Agro-Intel Registration Update"
+        msg["From"] = smtp_email
+        msg["To"] = application["email"]
+
+        body = f"""
+Dear {application['name']},
+
+Thank you for applying to join Agro-Intel as an agricultural expert.
+
+After reviewing your submitted details and documents, your registration request was not approved.
+
+Reason: {reason}
+
+You will not receive an Agriculturalist ID and you cannot log in to the Agro-Intel portal with this request.
+
+If needed, please contact support@agrointel.com.
+
+Regards,
+Agro-Intel Team
+"""
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+
+        pending_verifications_collection.update_one(
+            {"_id": application_id},
+            {"$set": {
+                "status": "rejected",
+                "rejectedAt": datetime.now(pytz.UTC),
+                "rejectionReason": reason
+            }}
+        )
+
+        return jsonify({"message": "Application rejected and applicant notified."}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ================= SLOT BOOKING ENDPOINTS =================
 
 @app.route('/api/agriculturalist-set-availability-slots', methods=['POST'])
@@ -1271,14 +1729,15 @@ def farmer_book_slot():
             return jsonify({"error": "Agriculturalist not found"}), 404
         
         existing_booking = appointments_collection.find_one({
-            "farmerId": current_user_id,
-            "agriculturalistId": data['agriculturalistId'],
-            "date": data['date'],
-            "status": "booked"
+        "farmerId": current_user_id,
+        "agriculturalistId": data["agriculturalistId"],
+        "status": "booked"
         })
-        
+
         if existing_booking:
-            return jsonify({"error": "You already have a booking with this agriculturalist on this date"}), 409
+             return jsonify({
+            "error": "You already have an active booking with this agriculturalist. Please cancel the existing appointment before booking again."
+             }), 409
         
         slot = availability_slots_collection.find_one({
             "agriculturalistId": data['agriculturalistId'],
@@ -1344,6 +1803,7 @@ def farmer_book_slot():
 def get_farmer_appointments(farmer_id):
     """Endpoint: Get all appointments for a farmer"""
     try:
+        auto_complete_past_appointments()
         current_user_id = get_jwt_identity()
         
         if current_user_id != farmer_id:
@@ -1355,7 +1815,7 @@ def get_farmer_appointments(farmer_id):
         if status:
             query["status"] = status
         
-        appointments = appointments_collection.find(query).sort("date", -1)
+        appointments = appointments_collection.find(query).sort("createdAt", -1)
         
         appointments_list = []
         for appointment in appointments:
@@ -1370,7 +1830,7 @@ def get_farmer_appointments(farmer_id):
                 "slotEndTime": appointment['slotEndTime'],
                 "dayOfWeek": appointment['dayOfWeek'],
                 "status": appointment['status'],
-                "createdAt": appointment['createdAt'].isoformat()
+                "createdAt": appointment['createdAt'].isoformat() if 'createdAt' in appointment else None
             }
             appointments_list.append(appointment_info)
         
@@ -1391,6 +1851,7 @@ def get_farmer_appointments(farmer_id):
 def get_agriculturalist_appointments(agriculturalist_id):
     """Endpoint: Get all appointments for an agriculturalist"""
     try:
+        auto_complete_past_appointments()
         current_user_id = get_jwt_identity()
         
         if current_user_id != agriculturalist_id:
@@ -1402,7 +1863,7 @@ def get_agriculturalist_appointments(agriculturalist_id):
         if status:
             query["status"] = status
         
-        appointments = appointments_collection.find(query).sort("date", -1)
+        appointments = appointments_collection.find(query).sort("createdAt", -1)
         
         appointments_list = []
         for appointment in appointments:
@@ -1418,7 +1879,7 @@ def get_agriculturalist_appointments(agriculturalist_id):
                 "slotEndTime": appointment['slotEndTime'],
                 "dayOfWeek": appointment['dayOfWeek'],
                 "status": appointment['status'],
-                "createdAt": appointment['createdAt'].isoformat()
+                "createdAt": appointment['createdAt'].isoformat() if 'createdAt' in appointment else None
             }
             appointments_list.append(appointment_info)
         
@@ -1485,6 +1946,148 @@ def cancel_appointment(appointment_id):
     
     except Exception as e:
         logger.error(f"Error cancelling appointment: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+    
+@app.route("/api/reschedule-appointment/<appointment_id>", methods=["POST"])
+@jwt_required()
+def reschedule_appointment(appointment_id):
+    try:
+        current_user_id = get_jwt_identity()
+        claims = get_jwt()
+        user_type = claims.get("userType", None)
+
+        if user_type != "agriculturalist":
+            return jsonify({"error": "Only agriculturalists can reschedule appointments"}), 403
+
+        data = request.get_json()
+
+        if not data:
+            return jsonify({"error": "Request body is required"}), 400
+
+        required_fields = ["newDate", "newSlotTime"]
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "Missing required fields newDate and newSlotTime"}), 400
+
+        appointment = appointments_collection.find_one({"_id": ObjectId(appointment_id)})
+        if not appointment:
+            return jsonify({"error": "Appointment not found"}), 404
+
+        if appointment["agriculturalistId"] != current_user_id:
+            return jsonify({"error": "You can only reschedule your own appointments"}), 403
+
+        if appointment["status"] != "booked":
+            return jsonify({
+                "error": f"Only booked appointments can be rescheduled. Current status: {appointment['status']}"
+            }), 400
+
+        old_date = appointment["date"]
+        old_slot_time = appointment["slotTime"]
+        farmer_id = appointment["farmerId"]
+        agriculturalist_id = appointment["agriculturalistId"]
+
+        new_date = data["newDate"]
+        new_slot_time = data["newSlotTime"]
+
+        try:
+            slot_date = datetime.strptime(new_date, "%Y-%m-%d").date()
+            today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
+            max_date = today + timedelta(days=7)
+
+            if slot_date < today:
+                return jsonify({"error": "Cannot reschedule to a past date"}), 400
+
+            if slot_date > max_date:
+                return jsonify({"error": "Cannot reschedule more than 7 days in advance"}), 400
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+        new_slot = availability_slots_collection.find_one({
+            "agriculturalistId": current_user_id,
+            "date": new_date,
+            "slotTime": new_slot_time
+        })
+
+        if not new_slot:
+            return jsonify({"error": "Selected slot not found"}), 404
+
+        if new_slot.get("isBooked", False):
+            return jsonify({"error": "Selected slot is already booked"}), 409
+
+        old_slot_id = appointment.get("slotId")
+
+        book_new_slot = availability_slots_collection.update_one(
+            {
+                "_id": new_slot["_id"],
+                "isBooked": False
+            },
+            {
+                "$set": {
+                    "isBooked": True,
+                    "bookedBy": farmer_id,
+                    "bookedAt": datetime.now(pytz.UTC)
+                }
+            }
+        )
+
+        if book_new_slot.modified_count == 0:
+            return jsonify({"error": "Slot was just booked by someone else"}), 409
+
+        if old_slot_id:
+            availability_slots_collection.update_one(
+                {"_id": old_slot_id},
+                {
+                    "$set": {
+                        "isBooked": False,
+                        "bookedBy": None
+                    },
+                    "$unset": {
+                        "bookedAt": ""
+                    }
+                }
+            )
+
+        appointments_collection.update_one(
+            {"_id": ObjectId(appointment_id)},
+            {
+                "$set": {
+                    "slotId": new_slot["_id"],
+                    "date": new_date,
+                    "slotTime": new_slot["slotTime"],
+                    "slotEndTime": new_slot["slotEndTime"],
+                    "dayOfWeek": new_slot["dayOfWeek"],
+                    "updatedAt": datetime.now(pytz.UTC),
+                    "rescheduledBy": current_user_id,
+                    "rescheduledAt": datetime.now(pytz.UTC)
+                }
+            }
+        )
+
+        farmer = farmers_collection.find_one({"_id": farmer_id})
+        agriculturalist = agriculturalists_collection.find_one({"_id": agriculturalist_id})
+
+        if farmer and agriculturalist and farmer.get("email"):
+            send_reschedule_email_to_farmer(
+                farmer_email=farmer["email"],
+                farmer_name=farmer.get("name", "Farmer"),
+                agriculturalist_name=agriculturalist.get("name", "Agriculturalist"),
+                old_date=old_date,
+                old_slot_time=old_slot_time,
+                new_date=new_date,
+                new_slot_time=new_slot["slotTime"]
+            )
+
+        logger.info(f"Appointment {appointment_id} rescheduled by agriculturalist {current_user_id}")
+
+        return jsonify({
+            "message": "Appointment rescheduled successfully",
+            "appointmentId": appointment_id,
+            "newDate": new_date,
+            "newSlotTime": new_slot["slotTime"],
+            "newSlotEndTime": new_slot["slotEndTime"]
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error rescheduling appointment: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/agriculturalist-availability-slots', methods=['POST'])
@@ -1939,6 +2542,506 @@ def confirm_forgot_password():
     except Exception as e:
         logger.error(f"Error confirming forgot password: {str(e)}")
         return jsonify({"error": str(e)}), 500
+    
+
+@app.route('/api/farmer-download-sensor-data/<farmer_id>', methods=['GET'])
+@jwt_required()
+def farmer_download_sensor_data(farmer_id):
+    current_user_id = get_jwt_identity()
+
+    if current_user_id != farmer_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = sensor_data_collection.find({"farmerId": farmer_id}).sort("timestamp", -1)
+
+    si = StringIO()
+    writer = csv.writer(si)
+
+    writer.writerow([
+        "Timestamp", "Nitrogen", "Phosphorous", "Potassium",
+        "Soil Moisture", "Soil pH", "Soil Temp"
+    ])
+
+    for d in data:
+        writer.writerow([
+            d['timestamp'],
+            d['nitrogen'],
+            d['phosphorous'],
+            d['potassium'],
+            d.get('soil_moisture') or d.get('soilMoisture'),
+            d.get('soil_ph') or d.get('soilPH'),
+            d.get('soil_temp') or d.get('soilTemp')
+        ])
+
+    return Response(
+        si.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={farmer_id}.csv"}
+    )
+
+
+@app.route('/api/farmer-send-sensor-data/<farmer_id>', methods=['POST'])
+@jwt_required()
+def farmer_send_sensor_data(farmer_id):
+    current_user_id = get_jwt_identity()
+
+    if current_user_id != farmer_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    # Check appointment exists
+    data = request.get_json() or {}
+    agriculturalist_id = data.get("agriculturalistId")
+
+    if not agriculturalist_id:
+        return jsonify({"error": "Missing required field agriculturalistId"}), 400
+
+    appointment = appointments_collection.find_one(
+    {
+        "farmerId": farmer_id,
+        "agriculturalistId": agriculturalist_id,
+        "status": {"$in": ["booked", "completed"]}
+    },
+    sort=[("createdAt", -1)]
+    )
+
+    if not appointment:
+       return jsonify(
+        {"error": "No eligible appointment found with this agriculturalist"}
+    ), 404
+
+    agriculturalist = agriculturalists_collection.find_one(
+    {"_id": agriculturalist_id}
+    )
+
+    if not agriculturalist:
+       return jsonify({"error": "Agriculturalist not found"}), 404
+
+    # Get sensor data
+    data = sensor_data_collection.find({"farmerId": farmer_id}).sort("timestamp", -1)
+
+    if sensor_data_collection.count_documents({"farmerId": farmer_id}) == 0:
+        return jsonify({"error": "No sensor data"}), 404
+
+    # Create CSV
+    si = StringIO()
+    writer = csv.writer(si)
+
+    writer.writerow([
+        "Timestamp", "Nitrogen", "Phosphorous", "Potassium",
+        "Soil Moisture", "Soil pH", "Soil Temp"
+    ])
+
+    for d in data:
+        writer.writerow([
+            d['timestamp'],
+            d['nitrogen'],
+            d['phosphorous'],
+            d['potassium'],
+            d.get('soil_moisture') or d.get('soilMoisture'),
+           d.get('soil_ph') or d.get('soilPH'),
+            d.get('soil_temp') or d.get('soilTemp')
+        ])
+
+    # Email
+    msg = MIMEMultipart()
+    msg['Subject'] = 'Farmer Sensor Data'
+    msg['From'] = SMTP_EMAIL
+    msg['To'] = agriculturalist['email']
+
+    # Get farmer details
+    farmer = farmers_collection.find_one({"_id": farmer_id})
+
+    # --------- FIX LOCATION ----------
+    location_parts = list(filter(None, [
+    farmer.get('village') or farmer.get('city'),
+    farmer.get('district'),
+    farmer.get('state')
+    ]))
+
+    location = ", ".join(location_parts)
+    pincode = farmer.get('pincode')
+
+    full_location = f"{location} - {pincode}" if pincode else (location if location else "N/A")
+    # --------------------------------
+
+    # Email body (clean formatting → no Gmail collapse)
+    body = (
+    f"Dear {agriculturalist.get('name', 'Agriculturalist')},\n\n"
+    f"Farmer {farmer.get('name', farmer_id)} (ID: {farmer_id}) has shared their latest sensor data with you via the Agro-Intel platform.\n\n"
+    f"Appointment ID: {str(appointment['_id'])}\n"
+    f"Farmer Location: {full_location}\n"
+    f"Device ID: {farmer.get('deviceId', 'N/A')}\n"
+    f"Total Records: {sensor_data_collection.count_documents({'farmerId': farmer_id})}\n\n"
+    f"Please find the sensor data CSV attached.\n\n"
+    f"Regards,\n"
+    f"Agro-Intel Platform"
+    )
+
+    # Create email
+    msg = MIMEMultipart()
+    msg['Subject'] = f"Agro-Intel: Sensor Data from Farmer {farmer.get('name', farmer_id)} ({farmer_id})"
+    msg['From'] = SMTP_EMAIL
+    msg['To'] = agriculturalist['email']
+
+    # Attach body
+    html_body = f"""
+<html>
+  <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+    <p>Dear {agriculturalist.get('name', 'Agriculturalist')},</p>
+
+    <p>
+      Farmer <b>{farmer.get('name', farmer_id)}</b> (ID: {farmer_id}) has shared their latest sensor data with you via the Agro-Intel platform.
+    </p>
+
+    <p>
+      <b>Appointment ID:</b> {str(appointment['_id'])}<br>
+      <b>Farmer Location:</b> {full_location}<br>
+      <b>Device ID:</b> {farmer.get('deviceId', 'N/A')}<br>
+      <b>Total Records:</b> {sensor_data_collection.count_documents({'farmerId': farmer_id})}
+    </p>
+
+    <p>Please find the sensor data CSV attached.</p>
+
+    <p>
+      Regards,<br>
+      Agro-Intel Platform
+    </p>
+  </body>
+</html>
+"""
+
+    msg.attach(MIMEText(html_body, 'html'))
+
+    # Attach CSV
+    attachment = MIMEApplication(si.getvalue(), Name="sensor_data.csv")
+    attachment['Content-Disposition'] = 'attachment; filename="sensor_data.csv"'
+    msg.attach(attachment)
+    # Send email
+    with smtplib.SMTP('smtp.gmail.com', 587) as server:
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+
+    return jsonify({"message": "Sensor data sent successfully"}), 200
+
+@app.route("/api/resend-otp-agriculturalist", methods=["POST"])
+def resend_otp_agriculturalist():
+    """Resend verification OTP for approved agriculturalist accounts"""
+    data = request.get_json()
+    agriculturalist_id = data.get("agriculturalistId")
+    
+    if not agriculturalist_id:
+        return jsonify({"error": "Missing agriculturalistId"}), 400
+    
+    # Find approved but unverified agriculturalist
+    agriculturalist = agriculturalists_collection.find_one({
+        "_id": agriculturalist_id,
+        "isEmailVerified": False
+    })
+    
+    if not agriculturalist:
+        return jsonify({"error": "Account not found or already verified"}), 404
+    
+    # Generate and store fresh OTP
+    otp = generate_otp()
+    otps_collection.replace_one(
+        {"userId": agriculturalist_id},
+        {"userId": agriculturalist_id, "otp": otp, "createdAt": datetime.now(pytz.UTC)},
+        upsert=True
+    )
+    
+    # Send OTP email
+    if send_otp_email(agriculturalist["email"], otp):
+        logger.info(f"Resent OTP to {agriculturalist['email']} for agriculturalist {agriculturalist_id}")
+        return jsonify({"message": "OTP resent successfully"}), 200
+    else:
+        logger.error(f"Failed to resend OTP to {agriculturalist['email']} for {agriculturalist_id}")
+        return jsonify({"error": "Failed to send OTP"}), 500
+
+
+# ================= CHAT ENDPOINTS =================
+
+@app.route('/api/chat/verify-access', methods=['POST'])
+@jwt_required()
+def verify_chat_access():
+    data = request.get_json(silent=True) or {}
+    current_user_id = get_jwt_identity()
+    claims = get_jwt()
+    user_type = claims.get('userType')
+
+    if 'otherUserId' not in data:
+        return jsonify({"error": "Missing otherUserId"}), 400
+
+    other_user_id = data['otherUserId']
+
+    try:
+        if user_type == "farmer":
+            farmer_id = current_user_id
+            agriculturalist_id = other_user_id
+        elif user_type == "agriculturalist":
+            farmer_id = other_user_id
+            agriculturalist_id = current_user_id
+        else:
+            logger.error(f"Invalid userType in JWT: {user_type}")
+            return jsonify({"error": "Invalid user type"}), 403
+
+        query = {
+            "farmerId": farmer_id,
+            "agriculturalistId": agriculturalist_id,
+            "status": "completed"
+        }
+
+        logger.info(
+            f"verify_chat_access: current_user_id={current_user_id}, "
+            f"user_type={user_type}, other_user_id={other_user_id}, query={query}"
+        )
+
+        completed = appointments_collection.find_one(query)
+
+        if not completed:
+            logger.warning(f"No completed appointment found for query: {query}")
+            return jsonify({
+                "canChat": False,
+                "error": "No completed appointment found between these users"
+            }), 403
+
+        room_id = f"CHAT_{farmer_id}_{agriculturalist_id}"
+        logger.info(f"Chat access verified for {current_user_id} -> room {room_id}")
+        return jsonify({"canChat": True, "roomId": room_id}), 200
+
+    except Exception as e:
+        logger.error(f"Error verifying chat access: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/chat/messages/<room_id>', methods=['GET'])
+@jwt_required()
+def get_chat_messages(room_id):
+    """Endpoint: Get last 50 messages for a chat room (user must belong to the room)"""
+    current_user_id = get_jwt_identity()
+
+    parts = room_id.split("_")
+    if len(parts) != 3 or parts[0] != "CHAT":
+        return jsonify({"error": "Invalid room ID format"}), 400
+
+    farmer_id = parts[1]
+    agriculturalist_id = parts[2]
+
+    if current_user_id not in [farmer_id, agriculturalist_id]:
+        return jsonify({"error": "Unauthorized access to this chat room"}), 403
+
+    try:
+        raw_messages = list(
+            chat_messages_collection.find(
+                {"roomId": room_id}
+            ).sort("timestamp", 1).limit(50)
+        )
+        messages = []
+        for msg in raw_messages:
+            messages.append({
+                "messageId": str(msg["_id"]),
+                "senderId": msg.get("senderId", ""),
+                "senderRole": msg.get("senderRole", ""),
+                "message": msg.get("message", ""),
+                "edited": msg.get("edited", False),
+                "timestamp": msg["timestamp"].isoformat() if hasattr(msg.get("timestamp"), "isoformat") else str(msg.get("timestamp", "")),
+            })
+
+        logger.info(f"Loaded {len(messages)} messages for room {room_id}")
+        return jsonify({"messages": messages, "roomId": room_id}), 200
+
+    except Exception as e:
+        logger.error(f"Error loading chat messages for room {room_id}: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/unread-counts/<user_id>', methods=['GET'])
+@jwt_required()
+def get_unread_counts(user_id):
+    current_user_id = get_jwt_identity()
+    if current_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    counts = list(unread_counts.find({'userId': user_id}, {'_id': 0}))
+    return jsonify(counts), 200
+
+@app.route('/api/unread-counts/<user_id>/<room_id>', methods=['DELETE'])
+@jwt_required()
+def clear_unread_count(user_id, room_id):
+    current_user_id = get_jwt_identity()
+    if current_user_id != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    unread_counts.delete_one({'userId': user_id, 'roomId': room_id})
+    logger.info(f"Cleared unread count for {user_id} in room {room_id}")
+    return jsonify({'success': True}), 200
+
+# ================= SOCKET.IO EVENTS =================
+
+@socketio.on("join_room")
+def handle_join_room(data):
+    """Socket.IO: User joins a chat room"""
+    room_id = data.get("roomId")
+    user_id = data.get("userId")
+
+    if not room_id or not user_id:
+        emit("error", {"message": "Missing roomId or userId"})
+        return
+
+    parts = room_id.split("_")
+    if len(parts) != 3 or user_id not in [parts[1], parts[2]]:
+        emit("error", {"message": "Unauthorized room access"})
+        return
+
+    join_room(room_id)
+    emit("joined", {"roomId": room_id, "userId": user_id}, to=room_id)
+    logger.info(f"User {user_id} joined room {room_id}")
+
+
+@socketio.on("join_personal_room")
+def handle_join_personal_room(data):
+    """Socket.IO: User joins their personal notification room"""
+    user_id = data.get("userId")
+
+    if not user_id:
+        emit("error", {"message": "Missing userId"})
+        return
+
+    join_room(str(user_id))
+    emit("personal_room_joined", {"userId": str(user_id)}, to=str(user_id))
+    logger.info(f"User {user_id} joined personal room {user_id}")
+
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    room_id = data.get('roomId')
+    sender_id = data.get('senderId')
+    sender_role = data.get('senderRole')
+    receiver_id = data.get('receiverId')
+    message = data.get('message', '').strip()
+
+    if not all([room_id, sender_id, sender_role, receiver_id, message]):
+        emit('error', {'message': 'Missing required fields'})
+        return
+
+    parts = room_id.split('_')
+    if len(parts) != 3 or sender_id not in [parts[1], parts[2]]:
+        emit('error', {'message': 'Unauthorized'})
+        return
+
+    try:
+        msg_doc = {
+            'roomId': room_id,
+            'senderId': sender_id,
+            'senderRole': sender_role,
+            'message': message,
+            'timestamp': datetime.now(pytz.UTC)
+        }
+        result = chat_messages_collection.insert_one(msg_doc)
+
+        # Broadcast to chat room
+        emit('receive_message', {
+            'messageId': str(result.inserted_id),
+            'senderId': sender_id,
+            'senderRole': sender_role,
+            'message': message,
+            'timestamp': msg_doc['timestamp'].isoformat()
+        }, to=room_id)
+
+        # Save unread count to DB (persists after logout)
+        unread_counts.update_one(
+            {'userId': receiver_id, 'roomId': room_id},
+            {'$inc': {'count': 1}},
+            upsert=True
+        )
+
+        # Real-time notification if receiver is online
+        emit('new_message_notification', {
+            'roomId': room_id
+        }, room=str(receiver_id))
+
+        logger.info(f"Message saved in room {room_id} by {sender_id}. Unread updated for {receiver_id}")
+
+    except Exception as e:
+        emit('error', {'message': str(e)})
+        logger.error(f"Error saving message in room {room_id}: {str(e)}")
+
+@socketio.on("leave_room")
+def handle_leave_room(data):
+    """Socket.IO: User leaves a chat room"""
+    room_id = data.get("roomId")
+    user_id = data.get("userId")
+    leave_room(room_id)
+    logger.info(f"User {user_id} left room {room_id}")
+
+
+@socketio.on("edit_message")
+def handle_edit_message(data):
+    """Socket.IO: Edit an existing message (only sender can edit)"""
+    room_id = data.get("roomId")
+    message_id = data.get("messageId")
+    sender_id = data.get("senderId")
+    new_message = data.get("newMessage", "").strip()
+
+    if not all([room_id, message_id, sender_id, new_message]):
+        emit("error", {"message": "Missing required fields"})
+        return
+
+    try:
+        from bson import ObjectId
+        msg = chat_messages_collection.find_one({"_id": ObjectId(message_id)})
+        if not msg:
+            emit("error", {"message": "Message not found"})
+            return
+        if msg["senderId"] != sender_id:
+            emit("error", {"message": "Unauthorized: cannot edit another user's message"})
+            return
+
+        chat_messages_collection.update_one(
+            {"_id": ObjectId(message_id)},
+            {"$set": {"message": new_message, "edited": True, "editedAt": datetime.now(pytz.UTC)}}
+        )
+
+        emit("message_edited", {
+            "messageId": message_id,
+            "newMessage": new_message,
+            "editedAt": datetime.now(pytz.UTC).isoformat()
+        }, to=room_id)
+
+        logger.info(f"Message {message_id} edited by {sender_id} in room {room_id}")
+
+    except Exception as e:
+        emit("error", {"message": str(e)})
+        logger.error(f"Error editing message {message_id}: {str(e)}")
+
+
+@socketio.on("delete_message")
+def handle_delete_message(data):
+    """Socket.IO: Delete a message (only sender can delete)"""
+    room_id = data.get("roomId")
+    message_id = data.get("messageId")
+    sender_id = data.get("senderId")
+
+    if not all([room_id, message_id, sender_id]):
+        emit("error", {"message": "Missing required fields"})
+        return
+
+    try:
+        from bson import ObjectId
+        msg = chat_messages_collection.find_one({"_id": ObjectId(message_id)})
+        if not msg:
+            emit("error", {"message": "Message not found"})
+            return
+        if msg["senderId"] != sender_id:
+            emit("error", {"message": "Unauthorized: cannot delete another user's message"})
+            return
+
+        chat_messages_collection.delete_one({"_id": ObjectId(message_id)})
+
+        emit("message_deleted", {"messageId": message_id}, to=room_id)
+
+        logger.info(f"Message {message_id} deleted by {sender_id} in room {room_id}")
+
+    except Exception as e:
+        emit("error", {"message": str(e)})
+        logger.error(f"Error deleting message {message_id}: {str(e)}")
+
 
 # Cleanup on exit
 @atexit.register
@@ -1950,4 +3053,4 @@ def cleanup():
 if __name__ == '__main__':
     host = os.getenv('SERVER_HOST', '0.0.0.0')
     port = int(os.getenv('SERVER_PORT', 5000))
-    app.run(host=host, port=port, debug=True)
+    socketio.run(app, host=host, port=port, debug=True)

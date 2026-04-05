@@ -1,20 +1,13 @@
 # Agro-Intel Backend
 
-The **Agro-Intel Backend** is a Flask-based REST API designed to power the Agro-Intel web interface and mobile app, enabling seamless management of **farmer** and **agriculturalist** accounts, real-time **soil sensor data**, **appointment booking** with 30-minute time slots, and secure **authentication** using JWT and OTP-based email verification. It uses **MongoDB** for data storage, **bcrypt** for password hashing, **JWT** for session management, and **SMTP** (Gmail) for sending OTPs.
+The **Agro-Intel Backend** is a Flask + Socket.IO REST API built to power the Agro-Intel web platform and mobile clients. It manages **farmer** and **agriculturalist** accounts, real-time **soil sensor data**, **appointment booking** with 30-minute slots, **real-time chat**, persistent **unread message counts**, and secure **authentication** using JWT and OTP-based email verification.
 
-Key features include:
-- Registration/login for **farmers** and **agriculturalists** with OTP verification.
-- IoT sensor data ingestion with validation.
-- Agriculturalist availability management (up to 7 days in advance).
-- Appointment booking and cancellation with conflict detection.
-- Profile management, password reset, and secure updates.
-- Email uniqueness enforced across both roles.
-- All timestamps are in **UTC** (convert to IST in frontend if needed).
-- CORS enabled for all origins (`*`).
+It uses **MongoDB** for persistence, **bcrypt** for password hashing, **JWT** for session handling, **Socket.IO** for real-time communication, and **SMTP** (Gmail) for OTP and CSV email delivery.
 
 ---
 
 ## Table of Contents
+
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
@@ -22,28 +15,37 @@ Key features include:
 - [Running the Application](#running-the-application)
 - [Deploying to Production](#deploying-to-production)
 - [API Endpoints](#api-endpoints)
+- [Socket.IO Events](#socketio-events)
 - [Testing](#testing)
 - [Directory Structure](#directory-structure)
-- [Contributing](#contributing)
-- [Database Schema & Indexes](#database-schema--indexes)
+- [Database Schema \\& Indexes](#database-schema--indexes)
 - [MongoDB CLI Commands](#mongodb-cli-commands)
+- [Contributing](#contributing)
 
 ---
 
 ## Features
 
 - **Dual User Roles**: `farmer` and `agriculturalist` with separate collections.
-- **OTP-based Email Verification** for registration, password reset, and profile updates.
-- **JWT Authentication** with role-based access control (`userType` claim).
-- **IoT Sensor Data Ingestion** with range validation and TTL (optional).
-- **30-Minute Time Slot Booking** (00:00 to 23:30).
-- **Availability Management** for agriculturalists (up to 7 days in advance).
-- **Appointment Booking & Cancellation** with conflict prevention.
-- **Search & Filter Agriculturalists** by location, name, availability.
-- **Secure Password Management** (old → OTP → new).
+- **OTP-based Email Verification** for registration, password reset, and password/profile update flows.
+- **JWT Authentication** with access control based on authenticated identity.
+- **IoT Sensor Data Ingestion** with validation.
+- **Sensor Data CSV Download** — farmer can download the last 30 days of data as a `.csv` file.
+- **Secure Sensor Data Sharing** — farmer can email the last 30 days of sensor data as CSV to an appointed agriculturalist only.
+- **30-Minute Time Slot Booking** from `00:00` to `23:30`.
+- **Availability Management** for agriculturalists up to 7 days in advance.
+- **Appointment Booking & Cancellation** with conflict detection.
+- **Real-Time Chat** via Socket.IO — unlocked only after a completed appointment between a farmer and an agriculturalist.
+- **Message Edit & Delete** — users can edit or delete only their own messages, with live synchronization to the other party.
+- **Chat History TTL** — chat messages are auto-deleted from MongoDB after 30 days via TTL index.
+- **Unread Message Count Support** — unread counts are stored per `userId + roomId`, increment when a new message arrives, can be fetched through REST, and are cleared when the chat is opened.
+- **Search & Filter Agriculturalists** by location, name, and availability.
+- **Secure Password Management** with OTP verification.
+- **Forgot Password Flow** for both roles.
 - **Email Uniqueness** enforced across both roles.
-- **CORS enabled** for all origins (`*`).
-- **Root endpoint (`/`)** returns `"Agro-Intel Server is up and Running"`.
+- **UTC Timestamps** across backend responses.
+- **CORS Enabled** for all origins (`*`).
+- **Health Check Root Endpoint** at `/`.
 
 ---
 
@@ -51,7 +53,7 @@ Key features include:
 
 - Python 3.8+
 - MongoDB 5.0+ (local or [MongoDB Atlas](https://www.mongodb.com/cloud/atlas))
-- Gmail account (for SMTP) with **App Password** (if 2FA enabled)
+- Gmail account with App Password enabled for SMTP
 - Git
 - `curl` or Postman for testing
 
@@ -59,31 +61,33 @@ Key features include:
 
 ## Installation
 
-1. **Clone the repository**:
+1. **Clone the repository**
    ```bash
    git clone https://github.com/yourusername/agro-intel-backend.git
    cd agro-intel-backend
    ```
 
-2. **Create virtual environment**:
+2. **Create a virtual environment**
    ```bash
    python -m venv venv
-   source venv/bin/activate  # Linux/Mac
+   source venv/bin/activate  # Linux / Mac
    # or
    venv\Scripts\activate     # Windows
    ```
 
-3. **Install dependencies**:
+3. **Install dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-   Ensure `requirements.txt` includes:
+   Example `requirements.txt`:
    ```txt
    flask==2.3.3
    pymongo==4.8.0
    flask-cors==4.0.1
    flask-jwt-extended==4.6.0
+   flask-socketio==5.3.6
+   simple-websocket==1.0.0
    python-dotenv==1.0.1
    bcrypt==4.2.0
    email-validator==2.2.0
@@ -91,11 +95,22 @@ Key features include:
    gunicorn==22.0.0
    ```
 
-4. **Set up MongoDB**:
-   - Run locally: `mongod`
-   - Or use [MongoDB Atlas](https://cloud.mongodb.com)
+   > `csv`, `io`, `logging`, `email.mime.*`, and similar modules are part of Python's standard library.
 
-5. **Create `.env` file**:
+4. **Set up MongoDB**
+   - Run locally with `mongod`, or
+   - Use MongoDB Atlas.
+
+5. **Initialize the database schema**
+   ```bash
+   python create_schema.py
+   ```
+   This creates the required collections and indexes, including:
+   - TTL index on `chat_messages.timestamp` for 30-day message expiry
+   - compound indexes for appointments lookup
+   - unread count collection indexes if defined in schema init
+
+6. **Create a `.env` file**
    ```env
    MONGO_URI=mongodb://localhost:27017/agro_intel
    JWT_SECRET_KEY=your_very_strong_secret_key_here
@@ -111,54 +126,56 @@ Key features include:
 
 ## Environment Variables
 
-| Variable | Description |
-|--------|-----------|
-| `MONGO_URI` | MongoDB connection string |
-| `JWT_SECRET_KEY` | Secret for JWT signing (strong random string) |
-| `FARMER_ID_PREFIX` | Prefix for farmer IDs (`FARM`) |
-| `AGRICULTURALIST_ID_PREFIX` | Prefix for agriculturalist IDs (`AGRI`) |
-| `SMTP_EMAIL` | Gmail address for sending OTPs |
-| `SMTP_PASSWORD` | Gmail **App Password** |
-| `SERVER_HOST` | `127.0.0.1` (dev), `0.0.0.0` (prod) |
-| `SERVER_PORT` | Default `5000` |
+| Variable | Description | Example |
+|---|---|---|
+| `MONGO_URI` | MongoDB connection string | `mongodb://localhost:27017/agro_intel` |
+| `JWT_SECRET_KEY` | Secret used to sign JWT tokens | `super-secret-key` |
+| `FARMER_ID_PREFIX` | Prefix for generated farmer IDs | `FARM` |
+| `AGRICULTURALIST_ID_PREFIX` | Prefix for generated agriculturalist IDs | `AGRI` |
+| `SMTP_EMAIL` | Gmail address used for OTP and CSV email sending | `your-email@gmail.com` |
+| `SMTP_PASSWORD` | Gmail App Password | `xxxx xxxx xxxx xxxx` |
+| `SERVER_HOST` | Bind host for Flask app | `127.0.0.1` |
+| `SERVER_PORT` | Port for Flask app | `5000` |
 
 ---
 
 ## Running the Application
 
-1. **Start MongoDB** (if local):
+1. **Start MongoDB** if running locally
    ```bash
    mongod
    ```
 
-2. **Run the app**:
+2. **Run the backend**
    ```bash
    python app.py
    ```
 
-3. **Test root endpoint**:
+3. **Test the root endpoint**
    ```bash
    curl http://127.0.0.1:5000/
    ```
-   **Expected**: `"Agro-Intel Server is up and Running"`
+
+   Expected response:
+   ```txt
+   Agro-Intel Server is up and Running
+   ```
 
 ---
 
 ## Deploying to Production
 
-### Using Gunicorn + Nginx + Supervisor (Ubuntu)
+### Gunicorn + Nginx + Supervisor
 
-1. **Update system**:
+> Since the app uses **Socket.IO** with threading mode, use a worker setup compatible with long-lived connections. Avoid the default sync worker.
+
+1. **Install system packages**
    ```bash
    sudo apt update && sudo apt upgrade -y
-   ```
-
-2. **Install dependencies**:
-   ```bash
    sudo apt install python3 python3-pip python3-venv git nginx supervisor -y
    ```
 
-3. **Clone & setup**:
+2. **Clone and configure the project**
    ```bash
    sudo mkdir -p /var/www/agro_intel_backend
    sudo chown $USER:$USER /var/www/agro_intel_backend
@@ -169,25 +186,27 @@ Key features include:
    pip install -r requirements.txt gunicorn
    ```
 
-4. **Copy `.env`** and secure it:
+3. **Add environment variables**
    ```bash
    nano .env
    chmod 600 .env
    ```
 
-5. **Test Gunicorn**:
+4. **Initialize schema**
    ```bash
-   gunicorn --workers 3 --bind 0.0.0.0:5000 app:app
+   python create_schema.py
    ```
 
-6. **Supervisor config**:
+5. **Test Gunicorn**
    ```bash
-   sudo nano /etc/supervisor/conf.d/agro_intel.conf
+   gunicorn --worker-class gthread --workers 1 --threads 4 --bind 0.0.0.0:5000 app:app
    ```
+
+6. **Supervisor config**
    ```ini
    [program:agro_intel]
    directory=/var/www/agro_intel_backend
-   command=/var/www/agro_intel_backend/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:5000 app:app
+   command=/var/www/agro_intel_backend/venv/bin/gunicorn --worker-class gthread --workers 1 --threads 4 --bind 0.0.0.0:5000 app:app
    user=ubuntu
    autostart=true
    autorestart=true
@@ -195,10 +214,7 @@ Key features include:
    stdout_logfile=/var/log/agro_intel.out.log
    ```
 
-7. **Nginx config**:
-   ```bash
-   sudo nano /etc/nginx/sites-available/agro_intel
-   ```
+7. **Nginx config**
    ```nginx
    server {
        listen 80;
@@ -209,14 +225,18 @@ Key features include:
            proxy_set_header Host $host;
            proxy_set_header X-Real-IP $remote_addr;
        }
+
+       location /socket.io/ {
+           proxy_pass http://127.0.0.1:5000;
+           proxy_http_version 1.1;
+           proxy_set_header Upgrade $http_upgrade;
+           proxy_set_header Connection "Upgrade";
+           proxy_set_header Host $host;
+       }
    }
    ```
-   ```bash
-   sudo ln -s /etc/nginx/sites-available/agro_intel /etc/nginx/sites-enabled/
-   sudo nginx -t && sudo systemctl restart nginx
-   ```
 
-8. **Enable SSL (Let’s Encrypt)**:
+8. **Enable SSL**
    ```bash
    sudo apt install certbot python3-certbot-nginx
    sudo certbot --nginx -d your-domain.com
@@ -226,516 +246,199 @@ Key features include:
 
 ## API Endpoints
 
-All endpoints are prefixed with `/api/`, except the root endpoint (`/`). Responses are JSON. Below are the 26 endpoints with `curl` commands for testing. Replace `<JWT_TOKEN>` with a valid token from the login endpoint, `<FARMER_ID>` with a valid farmer ID (e.g., `FARM123456`), and `<AGRI_ID>` with a valid agriculturalist ID (e.g., `AGRI789012`). Use your real email for OTP-based endpoints. Timestamps in responses are in UTC.
+All API routes are prefixed with `/api/` except the root endpoint `/`. Responses are JSON unless otherwise noted.
 
-### 0. Root Endpoint
-- **Path**: `/`
-- **Method**: GET
-- **Description**: Checks if the server is running.
-- **curl Command**:
-  ```bash
-  curl http://127.0.0.1:5000/
-  ```
-- **Response**:
-  - Success (200): `"Agro-Intel Server is up and Running"`
+### Core Authentication & Profile
 
----
+| # | Method | Endpoint | Purpose |
+|---|---|---|---|
+| 1 | POST | `/api/register-farmer` | Start farmer registration with OTP |
+| 2 | POST | `/api/confirm-register-farmer` | Confirm farmer OTP |
+| 3 | POST | `/api/register-agriculturalist` | Start agriculturalist registration with OTP |
+| 4 | POST | `/api/confirm-register-agriculturalist` | Confirm agriculturalist OTP |
+| 5 | POST | `/api/login-farmer` | Farmer login |
+| 6 | POST | `/api/login-agriculturalist` | Agriculturalist login |
+| 7 | GET | `/api/profile-farmer/<farmer_id>` | Get farmer profile |
+| 8 | PUT | `/api/update-profile-farmer` | Update farmer profile |
+| 9 | GET | `/api/profile-agriculturalist/<agri_id>` | Get agriculturalist profile |
+| 10 | PUT | `/api/update-profile-agriculturalist` | Update agriculturalist profile |
 
-### 1. Register Farmer
-- **Path**: `/register-farmer`
-- **Method**: POST
-- **Description**: Initiates farmer registration, sending an OTP to the provided email. Mandatory fields: `name`, `email`, `mobileNumber`, `password`, `cityVillage`, `district`, `state`, `deviceId`, `upiId`. Validates `deviceId` and `upiId` as non-empty strings. Ensures email and mobile uniqueness across `farmers` and `agriculturalists` collections.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/register-farmer \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Ram Singh","email":"ram@example.com","mobileNumber":"9876543210","password":"secure123","cityVillage":"Anandpur","district":"Patiala","state":"Punjab","deviceId":"SOIL123","upiId":"ram@upi"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "OTP sent to email for registration verification", "farmerId": "FARM123456"}`
-  - Error (400, 409): `{"error": "Missing mandatory fields"}`, `{"error": "Email already exists"}`
+### Discovery, Sensor, Availability, Appointment
 
----
+| # | Method | Endpoint | Purpose |
+|---|---|---|---|
+| 11 | GET | `/api/find-agriculturalist` | Search agriculturalists |
+| 12 | POST | `/api/send-sensor-data` | Ingest IoT sensor data |
+| 13 | GET | `/api/get-sensor-data/<farmer_id>` | Fetch paginated sensor data |
+| 14 | GET | `/api/get-latest-sensor-data/<farmer_id>` | Fetch latest sensor reading |
+| 15 | GET | `/api/farmer-download-sensor-data/<farmer_id>` | Download 30-day CSV |
+| 16 | POST | `/api/farmer-send-sensor-data/<farmer_id>` | Email sensor data CSV to agriculturalist |
+| 17 | POST | `/api/agriculturalist-set-availability-slots` | Set agriculturalist slots |
+| 18 | GET | `/api/farmer-get-available-slots/<agri_id>` | Get available slots |
+| 19 | POST | `/api/farmer-book-slot` | Book slot |
+| 20 | GET | `/api/farmer-appointments/<farmer_id>` | Farmer appointments |
+| 21 | GET | `/api/agriculturalist-appointments/<agri_id>` | Agriculturalist appointments |
+| 22 | POST | `/api/cancel-appointment/<appointment_id>` | Cancel appointment |
+| 23 | POST | `/api/agriculturalist-availability-slots` | View own slots |
 
-### 2. Confirm Farmer Registration
-- **Path**: `/confirm-register-farmer`
-- **Method**: POST
-- **Description**: Verifies the OTP to complete farmer registration.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/confirm-register-farmer \
-  -H "Content-Type: application/json" \
-  -d '{"farmerId":"FARM123456","otp":"123456"}'
-  ```
-- **Response**:
-  - Success (201): `{"message": "Farmer Registration Successful", "farmerId": "FARM123456"}`
-  - Error (400, 401, 404): `{"error": "Invalid OTP"}`, `{"error": "Pending registration not found or expired"}`
+### Password & Recovery
 
----
+| # | Method | Endpoint | Purpose |
+|---|---|---|---|
+| 24 | POST | `/api/update-password-farmer` | Start farmer password update |
+| 25 | POST | `/api/confirm/update-password-farmer` | Confirm farmer password update |
+| 26 | POST | `/api/update-password-agriculturalist` | Start agriculturalist password update |
+| 27 | POST | `/api/confirm/update-password-agriculturalist` | Confirm agriculturalist password update |
+| 28 | POST | `/api/forgot-password` | Start forgot password flow |
+| 29 | POST | `/api/confirm-forgot-password` | Confirm forgot password flow |
 
-### 3. Register Agriculturalist
-- **Path**: `/register-agriculturalist`
-- **Method**: POST
-- **Description**: Initiates agriculturalist registration, sending an OTP to the provided email. Mandatory fields: `name`, `email`, `mobileNumber`, `password`, `address`, `cityVillage`, `district`, `state`, `pincode`, `upiId`. Generates `agriculturalistId` as `AGRIxxxxxx`. Ensures email and mobile uniqueness across both collections.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/register-agriculturalist \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Dr. Sharma","email":"sharma@agro.com","mobileNumber":"9123456789","password":"expert123","address":"123 Green St","cityVillage":"Hisar","district":"Hisar","state":"Haryana","pincode":"125001","upiId":"sharma@paytm"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "OTP sent to email for registration verification", "agriculturalistId": "AGRI789012"}`
-  - Error (400, 409): `{"error": "Missing mandatory fields"}`, `{"error": "Email already exists"}`
+### Chat & Unread Counts
 
----
+| # | Method | Endpoint | Purpose |
+|---|---|---|---|
+| 30 | POST | `/api/chat/verify-access` | Verify completed appointment and return `roomId` |
+| 31 | GET | `/api/chat/messages/<room_id>` | Fetch last 50 room messages |
+| 32 | GET | `/api/unread-counts/<user_id>` | Fetch unread message counts for a user |
+| 33 | DELETE | `/api/unread-counts/<user_id>/<room_id>` | Clear unread count for one room |
 
-### 4. Confirm Agriculturalist Registration
-- **Path**: `/confirm-register-agriculturalist`
-- **Method**: POST
-- **Description**: Verifies the OTP to complete agriculturalist registration.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/confirm-register-agriculturalist \
-  -H "Content-Type: application/json" \
-  -d '{"agriculturalistId":"AGRI789012","otp":"123456"}'
-  ```
-- **Response**:
-  - Success (201): `{"message": "Agriculturalist Registration Successful", "agriculturalistId": "AGRI789012"}`
-  - Error (400, 401, 404): `{"error": "Invalid OTP"}`, `{"error": "Pending registration not found or expired"}`
+### Root
 
----
+| # | Method | Endpoint | Purpose |
+|---|---|---|---|
+| 0 | GET | `/` | Health check |
 
-### 5. Farmer Login
-- **Path**: `/login-farmer`
-- **Method**: POST
-- **Description**: Authenticates a farmer and returns a JWT token.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/login-farmer \
-  -H "Content-Type: application/json" \
-  -d '{"email":"ram@example.com","password":"secure123"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Farmer login successful", "farmerId": "FARM123456", "name": "Ram Singh", "token": "eyJ..."}`
-  - Error (400, 401, 403): `{"error": "Invalid email or password"}`, `{"error": "Email not verified"}`
+### Sample Chat/Unread Endpoints
+
+#### Verify Chat Access
+```bash
+curl -X POST http://127.0.0.1:5000/api/chat/verify-access \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer <JWT_TOKEN>" \
+-d '{"otherUserId":"AGRI789012"}'
+```
+
+#### Get Chat Messages
+```bash
+curl -X GET http://127.0.0.1:5000/api/chat/messages/CHAT_FARM123456_AGRI789012 \
+-H "Authorization: Bearer <JWT_TOKEN>"
+```
+
+#### Get Unread Counts
+```bash
+curl -X GET http://127.0.0.1:5000/api/unread-counts/FARM123456 \
+-H "Authorization: Bearer <JWT_TOKEN>"
+```
+
+#### Clear Unread Count for a Room
+```bash
+curl -X DELETE http://127.0.0.1:5000/api/unread-counts/FARM123456/CHAT_FARM123456_AGRI789012 \
+-H "Authorization: Bearer <JWT_TOKEN>"
+```
 
 ---
 
-### 6. Agriculturalist Login
-- **Path**: `/login-agriculturalist`
-- **Method**: POST
-- **Description**: Authenticates an agriculturalist and returns a JWT token.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/login-agriculturalist \
-  -H "Content-Type: application/json" \
-  -d '{"email":"sharma@agro.com","password":"expert123"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Agriculturalist login successful", "agriculturalistId": "AGRI789012", "token": "eyJ..."}`
-  - Error (400, 401, 403): `{"error": "Invalid email or password"}`, `{"error": "Email not verified"}`
+## Socket.IO Events
 
----
+The server uses **Socket.IO** with `async_mode="threading"`.
 
-### 7. Get Farmer Profile
-- **Path**: `/profile-farmer/<farmer_id>`
-- **Method**: GET
-- **Description**: Retrieves farmer profile. Requires farmer authentication (own profile only).
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET http://127.0.0.1:5000/api/profile-farmer/FARM123456 \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200):
-    ```json
-    {
-      "message": "Farmer profile retrieved successfully",
-      "profile": {
-        "farmerId": "FARM123456",
-        "name": "Ram Singh",
-        "email": "ram@example.com",
-        "mobileNumber": "9876543210",
-        "cityVillage": "Anandpur",
-        "district": "Patiala",
-        "state": "Punjab",
-        "deviceId": "SOIL123",
-        "upiId": "ram@upi",
-        "isEmailVerified": true,
-        "createdAt": "2025-07-02T06:58:00.123Z",
-        "updatedAt": "2025-07-02T06:58:00.123Z"
-      }
-    }
-    ```
-  - Error (403, 404): `{"error": "Unauthorized access"}`, `{"error": "User not found"}`
+### Client → Server
 
----
+#### `join_room`
+```json
+{ "roomId": "CHAT_FARM123456_AGRI789012", "userId": "FARM123456" }
+```
 
-### 8. Update Farmer Profile
-- **Path**: `/update-profile-farmer`
-- **Method**: PUT
-- **Description**: Updates farmer profile (except password). Updatable fields: `name`, `mobileNumber`, `cityVillage`, `district`, `state`, `upiId`. Requires farmer authentication.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X PUT http://127.0.0.1:5000/api/update-profile-farmer \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"name":"Ram Kumar","mobileNumber":"9876543211"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Farmer profile updated successfully", "farmerId": "FARM123456", "updatedFields": ["name", "mobileNumber"]}`
-  - Error (400, 404): `{"error": "No valid fields provided for update"}`, `{"error": "Farmer not found"}`
+#### `join_personal_room`
+```json
+{ "userId": "FARM123456" }
+```
 
----
+#### `send_message`
+```json
+{
+  "roomId": "CHAT_FARM123456_AGRI789012",
+  "senderId": "FARM123456",
+  "senderRole": "farmer",
+  "receiverId": "AGRI789012",
+  "message": "Hello!"
+}
+```
 
-### 9. Get Agriculturalist Profile
-- **Path**: `/profile-agriculturalist/<agri_id>`
-- **Method**: GET
-- **Description**: Retrieves agriculturalist profile. Requires agriculturalist authentication (own profile only).
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET http://127.0.0.1:5000/api/profile-agriculturalist/AGRI789012 \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Similar structure with `address`, `pincode`, `isAvailable`
-  - Error (403, 404): `{"error": "Unauthorized access"}`, `{"error": "User not found"}`
+#### `edit_message`
+```json
+{
+  "roomId": "CHAT_FARM123456_AGRI789012",
+  "messageId": "64f1a2b3c4d5e6f7a8b9c0d1",
+  "senderId": "FARM123456",
+  "newMessage": "Hello, updated!"
+}
+```
 
----
+#### `delete_message`
+```json
+{
+  "roomId": "CHAT_FARM123456_AGRI789012",
+  "messageId": "64f1a2b3c4d5e6f7a8b9c0d1",
+  "senderId": "FARM123456"
+}
+```
 
-### 10. Update Agriculturalist Profile
-- **Path**: `/update-profile-agriculturalist`
-- **Method**: PUT
-- **Description**: Updates agriculturalist profile (except password). Updatable fields: `name`, `mobileNumber`, `address`, `cityVillage`, `district`, `state`, `pincode`, `upiId`.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X PUT http://127.0.0.1:5000/api/update-profile-agriculturalist \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"name":"Dr. A. Sharma","pincode":"125002"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Agriculturalist profile updated successfully", "agriculturalistId": "AGRI789012", "updatedFields": ["name", "pincode"]}`
+#### `leave_room`
+```json
+{ "roomId": "CHAT_FARM123456_AGRI789012", "userId": "FARM123456" }
+```
 
----
+### Server → Client
 
-### 11. Find Agriculturalists
-- **Path**: `/find-agriculturalist`
-- **Method**: GET
-- **Description**: Allows logged-in users to search and filter agriculturalists by name, state, district, availability. Supports pagination. Requires user authentication.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **Query Parameters** (optional):
-  - `state`, `district`, `isAvailable` (true/false), `search` (name/email), `page`, `limit`
-- **curl Command**:
-  ```bash
-  curl -X GET "http://127.0.0.1:5000/api/find-agriculturalist?state=Haryana&district=Hisar&isAvailable=true&search=sharma&page=1&limit=20" \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns `totalCount`, `page`, `limit`, `agriculturalists` list with `agriculturalistId`, `name`, `email`, `mobileNumber`, `address`, `cityVillage`, `district`, `state`, `pincode`, `upiId`, `isAvailable`, `createdAt`
-
----
-
-### 12. Send Sensor Data
-- **Path**: `/send-sensor-data`
-- **Method**: POST
-- **Description**: Records soil sensor data from a device. Validates `deviceId` and sensor ranges.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/send-sensor-data \
-  -H "Content-Type: application/json" \
-  -d '{"device_id":"SOIL123","nitrogen":45.5,"phosphorous":20.1,"potassium":35.8,"soil_moisture":65.2,"soil_ph":6.8,"soil_temp":28.3}'
-  ```
-- **Response**:
-  - Success (201): `{"message": "Sensor data received and stored successfully", "sensorDataId": "...", "farmerId": "FARM123456", "timestamp": "2025-07-02T06:58:00.123Z"}`
-  - Error (400, 404): `{"error": "Device ID not found"}`, `{"error": "Nitrogen value out of range (0-300)"}`
-
----
-
-### 13. Get Sensor Data (Farmer)
-- **Path**: `/get-sensor-data/<farmer_id>`
-- **Method**: GET
-- **Description**: Retrieves sensor data for a farmer, accessible by the farmer themselves. Supports pagination.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET "http://127.0.0.1:5000/api/get-sensor-data/FARM123456?page=1&limit=50" \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns `totalCount`, `page`, `limit`, `sensorData` list with `sensorDataId`, `deviceId`, `nitrogen`, `phosphorous`, `potassium`, `soil_moisture`, `soil_ph`, `soil_temp`, `timestamp`
-
----
-
-### 14. Get Latest Sensor Data
-- **Path**: `/get-latest-sensor-data/<farmer_id>`
-- **Method**: GET
-- **Description**: Retrieves the most recent sensor record for a farmer. Requires farmer authentication.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET http://127.0.0.1:5000/api/get-latest-sensor-data/FARM123456 \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns latest `sensorData` object
-  - Error (404): `{"error": "No sensor data found"}`
-
----
-
-### 15. Set Availability Slots (Agriculturalist)
-- **Path**: `/agriculturalist-set-availability-slots`
-- **Method**: POST
-- **Description**: Allows a logged-in agriculturalist to set availability slots for a specific date (up to 7 days in advance). Slots must be in 30-minute intervals (00:00 to 23:30).
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/agriculturalist-set-availability-slots \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"agriculturalistId":"AGRI789012","date":"2025-11-05","slots":["09:00","09:30","10:00"]}'
-  ```
-- **Response**:
-  - Success (201): `{"message": "Availability slots set successfully", "agriculturalistId": "AGRI789012", "date": "2025-11-05", "slotsAdded": 3, "totalSlots": 3}`
-  - Error (400, 403): `{"error": "Cannot set availability for past dates"}`, `{"error": "Invalid slot time"}`
-
----
-
-### 16. Get Available Slots (Farmer)
-- **Path**: `/farmer-get-available-slots/<agri_id>`
-- **Method**: GET
-- **Description**: Retrieves available slots for an agriculturalist on a specific date. Requires user authentication.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET "http://127.0.0.1:5000/api/farmer-get-available-slots/AGRI789012?date=2025-11-05" \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns `agriculturalistName`, `availableSlots` list with `slotId`, `slotTime`, `slotEndTime`, `dayOfWeek`
-
----
-
-### 17. Book Slot (Farmer)
-- **Path**: `/farmer-book-slot`
-- **Method**: POST
-- **Description**: Allows a logged-in farmer to book a slot with an agriculturalist. Prevents double-booking.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/farmer-book-slot \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"agriculturalistId":"AGRI789012","date":"2025-11-05","slotTime":"09:30"}'
-  ```
-- **Response**:
-  - Success (201): `{"message": "Slot booked successfully", "appointmentId": "...", "agriculturalistName": "Dr. Sharma", "slotTime": "09:30", "slotEndTime": "10:00"}`
-  - Error (409): `{"error": "This slot is already booked"}`
-
----
-
-### 18. Get Farmer Appointments
-- **Path**: `/farmer-appointments/<farmer_id>`
-- **Method**: GET
-- **Description**: Retrieves all appointments for a farmer. Optional `status` filter.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET "http://127.0.0.1:5000/api/farmer-appointments/FARM123456?status=booked" \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns `appointments` list with `appointmentId`, `agriculturalistName`, `date`, `slotTime`, `status`
-
----
-
-### 19. Get Agriculturalist Appointments
-- **Path**: `/agriculturalist-appointments/<agri_id>`
-- **Method**: GET
-- **Description**: Retrieves all appointments for an agriculturalist.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X GET http://127.0.0.1:5000/api/agriculturalist-appointments/AGRI789012 \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): Returns `appointments` list with `farmerName`, `farmerMobile`
-
----
-
-### 20. Cancel Appointment
-- **Path**: `/cancel-appointment/<appointment_id>`
-- **Method**: POST
-- **Description**: Cancels an appointment (farmer or agriculturalist). Frees the slot.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/cancel-appointment/appointment123 \
-  -H "Authorization: Bearer <JWT_TOKEN>"
-  ```
-- **Response**:
-  - Success (200): `{"message": "Appointment cancelled successfully", "appointmentId": "appointment123"}`
-
----
-
-### 21. View Own Slots (Agriculturalist)
-- **Path**: `/agriculturalist-availability-slots`
-- **Method**: POST
-- **Description**: Retrieves all availability slots for the agriculturalist, grouped by date.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/agriculturalist-availability-slots \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"agriculturalistId":"AGRI789012","date":"2025-11-05"}'
-  ```
-- **Response**:
-  - Success (200): Returns `slotsByDate` with `slotId`, `slotTime`, `isBooked`, `bookedBy`
-
----
-
-### 22. Update Farmer Password (Initiate)
-- **Path**: `/update-password-farmer`
-- **Method**: POST
-- **Description**: Initiates password change for farmer, sending OTP after verifying old password.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/update-password-farmer \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"oldPassword":"secure123","newPassword":"newpass456"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "OTP sent to your email for password verification", "farmerId": "FARM123456"}`
-
----
-
-### 23. Confirm Farmer Password Update
-- **Path**: `/confirm/update-password-farmer`
-- **Method**: POST
-- **Description**: Verifies OTP to complete farmer password change.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/confirm/update-password-farmer \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"otp":"123456"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Password changed successfully", "farmerId": "FARM123456"}`
-
----
-
-### 24. Update Agriculturalist Password (Initiate)
-- **Path**: `/update-password-agriculturalist`
-- **Method**: POST
-- **Description**: Initiates password change for agriculturalist.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/update-password-agriculturalist \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"oldPassword":"expert123","newPassword":"newexpert456"}'
-  ```
-
----
-
-### 25. Confirm Agriculturalist Password Update
-- **Path**: `/confirm/update-password-agriculturalist`
-- **Method**: POST
-- **Description**: Verifies OTP to complete agriculturalist password change.
-- **Headers**: `Authorization: Bearer <JWT_TOKEN>`
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/confirm/update-password-agriculturalist \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -d '{"otp":"123456"}'
-  ```
-
----
-
-### 26. Forgot Password (Both Roles)
-- **Path**: `/forgot-password`
-- **Method**: POST
-- **Description**: Initiates password reset for a user or agriculturalist, sending an OTP to the email. Checks email in both collections. Returns `userId` and `userType`.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/forgot-password \
-  -H "Content-Type: application/json" \
-  -d '{"email":"ram@example.com","newPassword":"newpass456"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "OTP sent successfully", "userId": "FARM123456", "userType": "farmer"}`
-  - Error (404): `{"error": "User not found"}`
-
----
-
-### 27. Confirm Forgot Password
-- **Path**: `/confirm-forgot-password`
-- **Method**: POST
-- **Description**: Verifies the OTP to complete password reset.
-- **curl Command**:
-  ```bash
-  curl -X POST http://127.0.0.1:5000/api/confirm-forgot-password \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"FARM123456","otp":"123456"}'
-  ```
-- **Response**:
-  - Success (200): `{"message": "Password changed successfully", "userId": "FARM123456", "userType": "farmer"}`
+| Event | Payload | Description |
+|---|---|---|
+| `joined` | `{ roomId, userId }` | Confirms room join |
+| `personal_room_joined` | `{ userId }` | Confirms personal notification room join |
+| `receive_message` | `{ messageId, senderId, senderRole, message, timestamp }` | Broadcasts new message |
+| `new_message_notification` | `{ roomId }` | Notifies receiver to refresh unread badge state |
+| `message_edited` | `{ messageId, newMessage, editedAt }` | Broadcasts message edit |
+| `message_deleted` | `{ messageId }` | Broadcasts message delete |
+| `error` | `{ message }` | Generic event error |
 
 ---
 
 ## Testing
 
-1. **Start the server**:
+1. **Start the server**
    ```bash
    python app.py
    ```
 
-2. **Test with curl**:
-   Use the `curl` commands provided above. Example workflow:
-   - **Register a farmer** → Confirm OTP → Login → Send sensor data → Book appointment
-
-3. **Test invalid inputs**:
-   ```bash
-   # Invalid deviceId (non-string)
-   curl -X POST http://127.0.0.1:5000/api/register-farmer -d '{"deviceId":[]}'
-   # Expected: {"error": "deviceId must be a non-empty string"}
+2. **Suggested test flow**
+   ```txt
+   Register farmer → Confirm OTP → Login →
+   Register agriculturalist → Confirm OTP → Login →
+   Create availability → Book appointment →
+   Mark appointment completed in MongoDB →
+   Verify chat access → join_room → send_message →
+   Check unread counts → open chat → clear unread count
    ```
+
+3. **Test unread count flow**
+   - Send a message from one user.
+   - Ensure `unread_counts` gets incremented for the receiver.
+   - Call `GET /api/unread-counts/<user_id>`.
+   - Open chat on frontend or call the DELETE unread endpoint.
+   - Confirm the unread count document is removed.
 
 ---
 
 ## Directory Structure
 
-```
+```bash
 agro-intel-backend/
-├── app.py                    # Main Flask application
+├── app.py                 # Main Flask + Socket.IO application
+├── create_schema.py       # MongoDB schema and index initialization
 ├── requirements.txt
-├── .env                      # Environment variables (not tracked)
+├── .env                   # Environment variables (not tracked)
 ├── venv/
-└── logs/                     # (optional)
+└── logs/                  # Optional runtime logs
 ```
-
----
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository.
-2. Create a feature branch (`git checkout -b feature/new-feature`).
-3. Commit changes (`git commit -m "Add new feature"`).
-4. Push to the branch (`git push origin feature/new-feature`).
-5. Open a pull request.
 
 ---
 
@@ -745,55 +448,138 @@ Contributions are welcome! Please:
 ```js
 {
   _id: "FARM123456",
-  name, email, mobileNumber, password, deviceId, upiId,
-  cityVillage, district, state,
+  name,
+  email,
+  mobileNumber,
+  password,
+  deviceId,
+  upiId,
+  cityVillage,
+  district,
+  state,
   isEmailVerified: true,
-  createdAt, updatedAt
+  createdAt,
+  updatedAt
 }
 ```
+Indexes: unique `email`, unique `mobileNumber`, `deviceId`, `state`, `district`, `cityVillage`, `isEmailVerified`, `createdAt`
 
 ### `agriculturalists`
 ```js
 {
   _id: "AGRI789012",
-  name, email, mobileNumber, password, upiId,
-  address, cityVillage, district, state, pincode,
+  name,
+  email,
+  mobileNumber,
+  password,
+  upiId,
+  address,
+  cityVillage,
+  district,
+  state,
+  pincode,
   isAvailable: true,
   isEmailVerified: true,
-  createdAt, updatedAt
+  createdAt,
+  updatedAt
 }
 ```
+Indexes: unique `email`, unique `mobileNumber`, `state`, `district`, `cityVillage`, `pincode`, `isAvailable`, `isEmailVerified`, `createdAt`
 
 ### `sensor_data`
 ```js
 {
-  farmerId, deviceId,
-  nitrogen, phosphorous, potassium,
-  soil_moisture, soil_ph, soil_temp,
-  timestamp, createdAt
+  farmerId,
+  deviceId,
+  nitrogen,
+  phosphorous,
+  potassium,
+  soil_moisture,
+  soil_ph,
+  soil_temp,
+  timestamp,
+  createdAt
 }
 ```
+Indexes: `farmerId`, `deviceId`, `timestamp`, compound `farmerId+timestamp`, compound `farmerId+deviceId`
 
 ### `availability_slots`
 ```js
 {
-  agriculturalistId, date: "2025-11-05",
-  slotTime: "09:30", slotEndTime: "10:00",
-  isBooked: false, bookedBy: null,
+  agriculturalistId,
+  date: "2025-11-05",
+  slotTime: "09:30",
+  slotEndTime: "10:00",
+  dayOfWeek: "Wednesday",
+  isBooked: false,
+  bookedBy: null,
   createdAt
 }
 ```
-**Index**: `{ agriculturalistId: 1, date: 1, slotTime: 1 }` (unique)
+Unique index: `{ agriculturalistId: 1, date: 1, slotTime: 1 }`
 
 ### `appointments`
 ```js
 {
-  farmerId, agriculturalistId, slotId,
-  date, slotTime, slotEndTime,
-  status: "booked"|"cancelled"|"completed",
+  farmerId,
+  agriculturalistId,
+  slotId,
+  date,
+  slotTime,
+  slotEndTime,
+  dayOfWeek,
+  status: "booked" | "cancelled" | "completed",
+  cancelledBy,
+  cancelledAt,
   createdAt
 }
 ```
+Indexes: `farmerId`, `agriculturalistId`, `slotId`, `status`, `date`, `createdAt`, compound `farmerId+status`, compound `agriculturalistId+status`, compound `farmerId+date`, compound `farmerId+agriculturalistId+status`
+
+### `chat_messages`
+```js
+{
+  roomId: "CHAT_FARM123456_AGRI789012",
+  senderId: "FARM123456",
+  senderRole: "farmer",
+  message: "Hello Doctor!",
+  edited: false,
+  editedAt: null,
+  timestamp: ISODate()
+}
+```
+Indexes: compound `roomId+timestamp`, TTL index on `timestamp` with 30-day expiry
+
+### `unread_counts`
+```js
+{
+  userId: "FARM123456",
+  roomId: "CHAT_FARM123456_AGRI789012",
+  count: 3
+}
+```
+Indexes: unique compound `{ userId: 1, roomId: 1 }`, optional `userId` index for lookup speed
+
+### `pending_updates`
+```js
+{
+  userId,
+  type,
+  email,
+  createdAt
+}
+```
+TTL: auto-deleted after 10 minutes
+
+### `otps`
+```js
+{
+  userId,
+  email,
+  createdAt
+}
+```
+TTL: auto-deleted after 10 minutes
 
 ---
 
@@ -805,24 +591,50 @@ use agro_intel
 ```
 
 ```js
-// List collections
 show collections
 
-// View farmers
-db.farmers.find().pretty()
+// View chat messages in a room
+db.chat_messages.find({
+  roomId: "CHAT_FARM123456_AGRI789012"
+}).sort({ timestamp: 1 })
 
-// Find by email
-db.farmers.findOne({email: "ram@example.com"})
+// View unread counts for a user
+db.unread_counts.find({
+  userId: "FARM123456"
+})
 
-// View sensor data
-db.sensor_data.find({"farmerId": "FARM123456"}).sort({timestamp: -1})
+// Check unread count index
+db.unread_counts.getIndexes()
 
-// Check indexes
-db.availability_slots.getIndexes()
+// Mark appointment as completed for chat testing
+db.appointments.updateOne(
+  { farmerId: "FARM123456", agriculturalistId: "AGRI789012" },
+  { $set: { status: "completed" } }
+)
+
+// Check chat TTL index
+db.chat_messages.getIndexes()
 ```
 
 ---
 
-**Project Maintained With Love for Farmers & Agricultural Experts**
+## Contributing
+
+1. Fork the repository.
+2. Create a feature branch:
+   ```bash
+   git checkout -b feature/your-feature
+   ```
+3. Commit your changes:
+   ```bash
+   git commit -m "Add your feature"
+   ```
+4. Push to the branch:
+   ```bash
+   git push origin feature/your-feature
+   ```
+5. Open a pull request.
 
 ---
+
+**Project maintained with love for farmers and agricultural experts.**
