@@ -1,0 +1,13 @@
+version: '3.9'
+
+services:
+  backend:
+    build: .
+    container_name: agro-intel-backend
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Maps to host machine's IP
+    restart: unless-stopped

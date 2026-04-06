@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+*.log
+uploads/
+dump/
+*.pem
+*.md
+.vscode/
+.idea/
